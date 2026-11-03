@@ -41,11 +41,11 @@ ensure_repo() {
   git ls-remote origin >/dev/null 2>&1 && return 0
   say "Creating the repository on GitHub"
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    gh repo create "$USER_NAME/$REPO_NAME" --public --description "Flash a second Android device over OTG from a rooted phone (Termux:GUI)" >/dev/null 2>&1
+    gh repo create "$USER_NAME/$REPO_NAME" --public --description "Flash a second Android device over OTG from Android using Termux (root optional)" >/dev/null 2>&1
   elif [ -f "$HOME/.git-credentials" ]; then
     tok="$(sed -n 's#^https://[^:]*:\([^@]*\)@github\.com.*#\1#p' "$HOME/.git-credentials" | head -n1)"
     [ -n "$tok" ] && curl -fsS -H "Authorization: token $tok" https://api.github.com/user/repos \
-      -d "{\"name\":\"$REPO_NAME\",\"description\":\"Flash a second Android device over OTG from a rooted phone (Termux:GUI)\"}" >/dev/null 2>&1
+      -d "{\"name\":\"$REPO_NAME\",\"description\":\"Flash a second Android device over OTG from Android using Termux (root optional)\"}" >/dev/null 2>&1
   fi
   git ls-remote origin >/dev/null 2>&1 || die "The repository doesn't exist yet and I couldn't create it. Create an empty PUBLIC repo named '$REPO_NAME' on github.com, then run this again."
 }
@@ -70,7 +70,7 @@ if [ -n "$stale" ]; then
   say "Removed old version tags from GitHub: $(echo $stale)"
 fi
 for t in $(git tag -l 'vg*'); do git tag -d "$t" >/dev/null 2>&1; done
-DESC="Flash, sideload and rescue a second Android device over OTG from a rooted phone - Termux:GUI app"
+DESC="Flash, sideload and rescue a second Android device over OTG using Termux - root optional"
 TOPICS="termux,android,adb,fastboot,flasher,rom,gsi,sideload,otg,kernelsu,magisk,termux-gui,python"
 if [ -z "${FLASHKIT_REMOTE:-}" ]; then   # best effort: repo description + topics
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then

@@ -2,16 +2,16 @@
 
 <img src="assets/banner.svg" alt="FlashKit - flash a second Android device over OTG" width="100%">
 
-[![Version](https://img.shields.io/badge/version-g9-9B6BFF?style=for-the-badge&labelColor=0E1626)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-g11-9B6BFF?style=for-the-badge&labelColor=0E1626)](CHANGELOG.md)
 [![Stars](https://img.shields.io/github/stars/chakradhartode/flashkit?style=for-the-badge&color=FFC857&labelColor=0E1626&logo=github&logoColor=white)](https://github.com/chakradhartode/flashkit/stargazers)
 [![Checks](https://img.shields.io/github/actions/workflow/status/chakradhartode/flashkit/check.yml?branch=main&style=for-the-badge&label=checks&labelColor=0E1626)](https://github.com/chakradhartode/flashkit/actions)
 [![License](https://img.shields.io/github/license/chakradhartode/flashkit?style=for-the-badge&color=37E08B&labelColor=0E1626)](LICENSE)
 
 [![Termux](https://img.shields.io/badge/Termux-F--Droid%20%7C%20GitHub-2DE2C4?style=for-the-badge&logo=termux&logoColor=white&labelColor=0E1626)](https://github.com/termux/termux-app#installation)
-[![Android](https://img.shields.io/badge/Android-root%20needed-4F9BFF?style=for-the-badge&logo=android&logoColor=white&labelColor=0E1626)](#-before-you-start)
+[![Android](https://img.shields.io/badge/Android-root%20optional-4F9BFF?style=for-the-badge&logo=android&logoColor=white&labelColor=0E1626)](#-before-you-start)
 
-**Flash, sideload and rescue a second Android device - straight from your rooted phone.**<br>
-No PC. No cables to a computer. Just an OTG cable and Termux.
+**Flash, sideload and rescue a second Android device - straight from your Android phone.**<br>
+Root is optional: use root when available, or the Termux USB-permission backend without root.
 
 [**📲 Install**](#-install-in-3-steps) &nbsp;·&nbsp; [**🚀 Use it**](#-open-flashkit) &nbsp;·&nbsp; [**🧭 Features**](#-what-can-it-do) &nbsp;·&nbsp; [**🔄 Update**](#-update) &nbsp;·&nbsp; [**🆘 Help**](#-help--troubleshooting)
 
@@ -21,7 +21,7 @@ No PC. No cables to a computer. Just an OTG cable and Termux.
 
 ## ✨ What is FlashKit?
 
-FlashKit turns your rooted phone into a **pocket flashing station**. Plug a second device into it with an OTG cable and
+FlashKit turns your Android phone into a **pocket flashing station**. Plug a second device into it with an OTG cable and
 use big, friendly buttons (a real Android app screen, not a wall of text) to sideload ROMs, flash images, do GSI
 installs, fix a black-screen recovery, and more. It even has a built-in **file manager with zip tools**.
 
@@ -52,7 +52,7 @@ installs, fix a black-screen recovery, and more. It even has a built-in **file m
 
 | You need | Why |
 |---|---|
-| 📱 **A rooted Android phone** (Magisk or KernelSU) | Root is used only for the adb / fastboot calls |
+| 📱 **An Android phone with Termux** | Root is optional. Non-root phones use Termux:API USB permissions and rootless adb/fastboot. |
 | 🖥️ **Termux** from **[F-Droid](https://f-droid.org/packages/com.termux/)** or **[GitHub](https://github.com/termux/termux-app/releases)** | *Not* the Google Play version - it is outdated and can't run the plugins |
 | 🔌 **An OTG cable / adapter** | To connect the device you want to flash |
 | 🌐 **Internet** (first install only) | To download packages and the two plugin apps |
@@ -94,11 +94,11 @@ When the installer finishes, the FlashKit menu opens. Press **Start FlashKit** -
 
 <br>
 
-1. Installs `python`, `android-tools` (adb + fastboot), `git`, `curl`, `termux-api`, `dialog`.
-2. Installs the `termuxgui` Python library.
-3. Asks for storage access (so it can see your ROM zips).
-4. Creates the commands **`flashkit`** and **`start flashkit`** (plus a *FlashKit* entry for the Termux:Widget home-screen widget).
-5. Reads your **Termux signing key**, then downloads **Termux:GUI** and **Termux:API** from GitHub / F-Droid - only a build signed with the *same* key is accepted - and installs them (silently with root, or via Android's installer).
+1. Installs `python`, `git`, `curl`, `termux-api`, and `dialog`.
+2. Selects `android-tools` on rooted phones, or `termux-adb` + `termux-fastboot` on non-root phones.
+3. Installs the `termuxgui` Python library and requests storage access.
+4. Creates the commands **`flashkit`** and **`start flashkit`**, plus a Termux:Widget shortcut.
+5. Downloads and installs matching-signature **Termux:API** and **Termux:GUI** Android apps.
 6. Opens FlashKit.
 
 Plugins you already have installed and working are never touched. Run `flashkit setup` any time to repeat it safely.
@@ -121,7 +121,7 @@ flashkit
 | 🔧 **Run manually (text menu)** | The older keyboard-driven version, for when you prefer text |
 | ⬇️ **Update FlashKit** | Gets the latest version from GitHub |
 | 🧩 **Check / install Termux:GUI + Termux:API** | Re-checks the two plugin apps |
-| 🩺 **Doctor** | Checks root, adb/fastboot, plugins, storage permission |
+| 🩺 **Doctor** | Checks the selected root/rootless backend, adb/fastboot, plugins, and storage permission |
 | 🔁 **Open FlashKit when Termux starts** | Turn on to skip typing the command |
 
 Shortcuts: `start flashkit` or `flashkit start` open the app straight away.
@@ -171,7 +171,7 @@ Gets the newest version from GitHub, shows what's new, and refreshes anything ne
 |---|---|
 | `flashkit` | Open the menu |
 | `flashkit start` · `start flashkit` | Open the app right away |
-| `flashkit manual` | Text-menu version |
+| `flashkit manual` | Text-menu version (also supports rootless mode) |
 | `flashkit update` | Update |
 | `flashkit plugins` | Check / install Termux:GUI + Termux:API |
 | `flashkit doctor` (or `check`) | Health check |
@@ -188,7 +188,7 @@ Gets the newest version from GitHub, shows what's new, and refreshes anything ne
 
 <br>
 
-Termux and its plugins only work together if they're signed by the same key. FlashKit reads your Termux's key and picks the matching download automatically. If it says nothing matches, reinstall **Termux, Termux:GUI and Termux:API all from F-Droid** (or all from GitHub), then run `flashkit plugins`.
+Termux and its plugins only work together if they're signed by the same key. FlashKit prefers the distribution reported by Android / `TERMUX_APK_RELEASE`, and checks the APK signer when Android lets Termux read it. If the source cannot be identified or Android refuses the APK, install **Termux, Termux:GUI and Termux:API all from the same source** (F-Droid or GitHub), then run `flashkit plugins`.
 </details>
 
 <details>
@@ -199,10 +199,17 @@ Normal - Android restarts Termux when a plugin is installed. Open Termux again; 
 </details>
 
 <details>
-<summary><b>"Root denied" / the app can't flash</b></summary>
+<summary><b>USB access without root</b></summary>
 
 <br>
-Open your root manager (Magisk / KernelSU) and allow **Termux**. Then run <code>flashkit doctor</code> - it should say <i>root works</i>.
+On non-root phones, FlashKit installs `termux-adb` and `termux-fastboot`. Install Termux and Termux:API from the same trusted source, then approve Android's USB permission prompt when you connect the target. The rootless tools use `termux-usb`; stock `android-tools` is not the rootless USB backend. The optional text menu also switches to these commands automatically.
+</details>
+
+<details>
+<summary><b>Termux:GUI or Termux:API APK says "App not installed" / "Problem parsing package"</b></summary>
+
+<br>
+Use Termux and both plugins from the same distribution source (all F-Droid or all GitHub). Android requires matching signatures. FlashKit selects the source using Android's installer metadata / `TERMUX_APK_RELEASE`, checks the APK archive and binary manifest (package ID, split APK status and minimum Android version), and verifies the signer when readable. The `termuxgui` Python bindings are installed with pip; `termux-gui-package` is an optional demo bundle, not a dependency.
 </details>
 
 <details>

@@ -21,7 +21,9 @@ def lp(b): return struct.pack("<I", len(b)) + b
 
 def make_apk(path, pkg, key, scheme="v1"):
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr("AndroidManifest.xml", b"manifest"); z.writestr("fake_package.txt", pkg); z.writestr("fake_key.txt", key.name if key else "none")
+        manifest = ("<?xml version=\"1.0\"?><manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" "
+                    "package=\"%s\"><uses-sdk android:minSdkVersion=\"23\"/></manifest>" % pkg).encode()
+        z.writestr("AndroidManifest.xml", manifest); z.writestr("fake_package.txt", pkg); z.writestr("fake_key.txt", key.name if key else "none")
         if key and scheme in ("v1", "both"): z.writestr("META-INF/CERT.RSA", key.p7)
     if key and scheme in ("v2", "both"):
         data = open(path, "rb").read()
@@ -54,7 +56,14 @@ FAKE_SU = r'''#!/bin/sh
 export FKROOT=1
 case "$2" in *"id -u") echo 0 ;; *) mkdir -p "$FKSTATE/tmp"; exec sh -c "$(printf '%s' "$2" | sed "s#/data/local/tmp#$FKSTATE/tmp#g")" ;; esac
 '''
-FAKE_OPEN = '#!/bin/sh\necho "$1" >> "$FKSTATE/open.log"\nFKROOT=1 pm install -r -d "$1" >> "$FKSTATE/open-out.log" 2>&1\n'
+FAKE_OPEN = r'''#!/bin/sh
+# Match termux-open's option form: the APK path is the final argument.
+apk=
+for arg in "$@"; do case "$arg" in *.apk) apk="$arg" ;; esac; done
+echo "$apk" >> "$FKSTATE/open.log"
+[ -n "$apk" ] || exit 2
+FKROOT=1 pm install -r -d "$apk" >> "$FKSTATE/open-out.log" 2>&1
+''' 
 
 class Env:
     def __init__(self):
@@ -115,6 +124,27 @@ class Fingerprints(unittest.TestCase):
         make_apk(e.tmp + "/u.apk", "x", None); self.assertEqual(tp.apk_certs(e.tmp + "/u.apk"), [])
         open(e.tmp + "/junk.apk", "wb").write(b"not a zip"); self.assertEqual(tp.apk_certs(e.tmp + "/junk.apk"), [])
         self.assertTrue(tp.same_signer([k.fp], [k.fp, "x"])); self.assertFalse(tp.same_signer([k.fp], ["y"])); self.assertFalse(tp.same_signer([], [k.fp]))
+
+class ApkValidation(unittest.TestCase):
+    def test_text_manifest_package_and_sdk(self):
+        e = Env(); self.addCleanup(e.close)
+        apk = e.tmp + "/valid.apk"
+        make_apk(apk, "com.termux.api", None)
+        info = tp.apk_manifest_info(apk)
+        self.assertEqual(info["package"], "com.termux.api")
+        self.assertEqual(info["min_sdk"], 23)
+        self.assertEqual(tp.validate_apk(apk, "com.termux.api")["package"], "com.termux.api")
+        with self.assertRaisesRegex(ValueError, "wrong package ID"):
+            tp.validate_apk(apk, "com.termux.gui")
+
+    def test_rejects_split_manifest(self):
+        e = Env(); self.addCleanup(e.close)
+        apk = e.tmp + "/split.apk"
+        with zipfile.ZipFile(apk, "w") as z:
+            z.writestr("AndroidManifest.xml", b'<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.termux.api" split="config.arm64_v8a"><uses-sdk android:minSdkVersion="23"/></manifest>')
+        with self.assertRaisesRegex(ValueError, "split APK"):
+            tp.validate_apk(apk, "com.termux.api")
+
 
 class Flow(unittest.TestCase):
     def setUp(self): self.e = Env(); self.addCleanup(self.e.close)

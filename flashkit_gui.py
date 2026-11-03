@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """FlashKit GUI - native Android UI (Termux:GUI) for flashing a SECOND device
-with adb/fastboot over OTG from a rooted phone.
+with adb/fastboot over OTG from Termux, with or without root.
 
 Run as your normal Termux user (NOT through su):
 
     python flashkit_gui.py
 
-Root is only used for the actual adb/fastboot calls (su -c ...). Anything that
-goes wrong is shown on screen and written to ~/flashkit_gui.log.
+Rooted phones use android-tools through su. Non-root phones use the
+termux-adb / termux-fastboot clients and Termux:API USB permission prompts.
+Anything that goes wrong is shown on screen and written to ~/flashkit_gui.log.
 """
 import os
 import re
@@ -34,7 +35,7 @@ import threading
 import subprocess
 import traceback
 
-VERSION = "g9"
+VERSION = "g11"
 HOME = os.path.expanduser("~")
 BASE = "/data/data/com.termux/files"
 # su's shell starts with a bare environment: without these, adb can't find
@@ -290,7 +291,10 @@ kill_job() {
 kill_job; sleep 0.3; kill_job
 pkill -9 -f "FLASHKIT_JO[B]_$TOK" 2>/dev/null
 sleep 0.2; kill_job
-if [ "$FOUND" -eq 0 ]; then pkill -9 -x fastboot 2>/dev/null; pkill -9 -x adb 2>/dev/null; fi
+if [ "$FOUND" -eq 0 ]; then
+  pkill -9 -x fastboot 2>/dev/null; pkill -9 -x adb 2>/dev/null
+  pkill -9 -x termux-fastboot 2>/dev/null; pkill -9 -x termux-adb 2>/dev/null
+fi
 exit 0
 """
 
@@ -300,12 +304,12 @@ def kill_script(token):
 
 
 class Job:
-    """A command streamed line by line from a worker thread - as root (su) by
-    default, or as the normal Termux user with root=False (package repair).
+    """Stream a worker command. Use root only when available; otherwise run as Termux user.
     cancel() really stops it (see _KILL)."""
 
-    def __init__(self, title, script, timeout=600, post=None, root=True):
-        self.title, self.script, self.timeout, self.post, self.root = title, script, timeout, post, root
+    def __init__(self, title, script, timeout=600, post=None, root=None):
+        self.title, self.script, self.timeout, self.post = title, script, timeout, post
+        self.root = have_root() if root is None else bool(root)
         self.q = queue.Queue()
         self.rc = None
         self.cancelled = False
@@ -476,14 +480,69 @@ def uinfo_script(root="/sys/bus/usb/devices"):
         'done' % root)
 
 
-PROBE_SCRIPT = ('chmod -R 666 /dev/bus/usb/*/* 2>/dev/null; '
-                'echo @@USB; ls /dev/bus/usb/*/* 2>/dev/null; '
-                'echo @@ADB; adb devices 2>&1; '
-                'FBOUT=$(fastboot devices 2>&1); echo @@FB; echo "$FBOUT"; '
-                'if printf "%s\n" "$FBOUT" | grep -Eq "^[^[:space:]]+[[:space:]]+[Ff]astboot"; then '
-                'echo @@FBU; if command -v timeout >/dev/null 2>&1; then timeout 8 fastboot getvar is-userspace 2>&1; '
-                'else fastboot getvar is-userspace 2>&1; fi; fi; '
-                'echo @@UINFO; ' + uinfo_script() + '; echo @@END')
+def have_root():
+    """Return True only when `su` can actually grant UID 0; cached for this app session."""
+    global _ROOT_AVAILABLE
+    if _ROOT_AVAILABLE is None:
+        if os.environ.get("FLASHKIT_FORCE_ROOTLESS") == "1":
+            _ROOT_AVAILABLE = False
+        else:
+            try:
+                p = subprocess.run(["su", "-c", "id -u"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=12, stdin=subprocess.DEVNULL)
+                _ROOT_AVAILABLE = p.returncode == 0 and p.stdout.decode("utf-8", "replace").strip().splitlines()[-1:] == ["0"]
+            except Exception:
+                _ROOT_AVAILABLE = False
+    return _ROOT_AVAILABLE
+
+
+_ROOT_AVAILABLE = None
+
+
+def adb_binary():
+    """Select the root-capable stock adb or the USB-permission-aware rootless client."""
+    if have_root():
+        return shutil.which("adb") or ""
+    return shutil.which("termux-adb") or ""
+
+
+def fastboot_binary():
+    """Select the root-capable stock fastboot or the rootless Termux USB client."""
+    if have_root():
+        return shutil.which("fastboot") or ""
+    return shutil.which("termux-fastboot") or ""
+
+
+def backend_name():
+    return "root" if have_root() else "rootless Termux USB"
+
+
+def device_run(cmd, timeout=30):
+    """Run host-side adb/fastboot work with root when available, otherwise as Termux user."""
+    return su_run(cmd, timeout=timeout) if have_root() else run_user(cmd, timeout=timeout)
+
+
+def fix_connection_script():
+    adb = shq(adb_binary() or "termux-adb")
+    if have_root():
+        return "%s kill-server; sleep 1; chmod -R 666 /dev/bus/usb/*/* 2>/dev/null; %s start-server" % (adb, adb)
+    return "%s kill-server; sleep 1; %s start-server" % (adb, adb)
+
+
+def make_probe_script():
+    adb = shq(adb_binary() or ("adb" if have_root() else "termux-adb"))
+    fb = shq(fastboot_binary() or ("fastboot" if have_root() else "termux-fastboot"))
+    usb = ('ls /dev/bus/usb/*/* 2>/dev/null' if have_root()
+           else 'echo "USB access is requested through Termux:API"')
+    chmod = 'chmod -R 666 /dev/bus/usb/*/* 2>/dev/null; ' if have_root() else ''
+    return (chmod + 'echo @@USB; ' + usb + '; '
+            'echo @@ADB; ' + adb + ' devices 2>&1; '
+            'FBOUT=$(' + fb + ' devices 2>&1); echo @@FB; echo "$FBOUT"; '
+            'if printf "%s\\n" "$FBOUT" | grep -Eq "^[^[:space:]]+[[:space:]]+[Ff]astboot"; then '
+            'echo @@FBU; if command -v timeout >/dev/null 2>&1; then timeout 8 ' + fb + ' getvar is-userspace 2>&1; '
+            'else ' + fb + ' getvar is-userspace 2>&1; fi; fi; '
+            'echo @@UINFO; ' + uinfo_script() + '; echo @@END')
+
 ADB_LINE = re.compile(r"^(\S+)\s+(device|offline|unauthorized|recovery|sideload|bootloader|"
                       r"rescue|authorizing|connecting|detached|host|no permissions)\b")
 FB_LINE = re.compile(r"^(\S+)\s+[Ff]astboot\w*")
@@ -491,12 +550,16 @@ USB_LINE = re.compile(r"^/dev/bus/usb/(\d+)/(\d+)$")
 
 
 def probe():
-    rc, out = su_run(PROBE_SCRIPT, timeout=20)
-    st = {"root": True, "err": "", "usb": 0, "adb": [], "fb": [], "model": "",
+    root = have_root()
+    adb_tool, fb_tool = adb_binary(), fastboot_binary()
+    script = make_probe_script()
+    rc, out = device_run(script, timeout=30)
+    backend_ok = bool(adb_tool and fb_tool and (root or shutil.which("termux-usb")))
+    st = {"root": root, "backend": backend_name(), "backend_ok": backend_ok,
+          "err": "", "usb": 0, "adb": [], "fb": [], "model": "",
           "fixed": "", "tool_err": {}, "fastbootd": None, "usbinfo": [], "t": time.time()}
     if "@@END" not in out:
-        st["root"] = False
-        st["err"] = out.strip() or "su gave no output (rc=%s)" % rc
+        st["err"] = out.strip() or "device probe returned no output (rc=%s)" % rc
         return st
     sec = None
     raw = {"ADB": [], "FB": []}
@@ -509,7 +572,7 @@ def probe():
             raw[sec].append(line)
         if sec == "USB":
             m = USB_LINE.match(line)
-            if m and int(m.group(2)) > 1:  # dev 001 is the root hub
+            if m and int(m.group(2)) > 1:
                 st["usb"] += 1
         elif sec == "ADB":
             m = ADB_LINE.match(line)
@@ -532,7 +595,14 @@ def probe():
                                       "product": parts[4] if len(parts) > 4 else "", "ifs": []})
             elif line.startswith("IF|") and st["usbinfo"]:
                 st["usbinfo"][-1]["ifs"].append(line[3:])
+    if not root:
+        # Sysfs remains readable for device identification even though /dev/bus/usb is private.
+        st["usb"] = max(st["usb"], len(st["usbinfo"]))
     st["tool_err"] = {"adb": tool_error("\n".join(raw["ADB"])), "fastboot": tool_error("\n".join(raw["FB"]))}
+    if not adb_tool:
+        st["tool_err"]["adb"] = "termux-adb is missing (rootless USB backend not installed)"
+    if not fb_tool:
+        st["tool_err"]["fastboot"] = "termux-fastboot is missing (rootless USB backend not installed)"
     return st
 
 
@@ -598,9 +668,10 @@ def usb_headline(st):
 
 def describe(st):
     """(headline, colour, hint) for a probe result."""
-    if not st.get("root", True):
-        return ("Root access missing", BAD,
-                "Allow superuser for Termux in Magisk/KernelSU, then tap Refresh. " + st.get("err", ""))
+    if not st.get("root", True) and not st.get("backend_ok", False):
+        return ("Rootless USB tools missing", BAD,
+                "Root is optional. Install the rootless Termux USB backend and Termux:API, then run "
+                "flashkit setup. FlashKit needs termux-adb and termux-fastboot when this phone is not rooted.")
     adb, fb = st["adb"], st["fb"]
     if tools_broken(st) and not (adb or fb):
         te = st["tool_err"]
@@ -675,58 +746,45 @@ fastboot --version 2>&1 | head -n 2
 exit 0
 """
 
-TOOLS_CHECK = 'adb version 2>&1 | head -n 3; echo @@; fastboot --version 2>&1 | head -n 3'
+def tools_check_script():
+    adb = shq(adb_binary() or "termux-adb")
+    fb = shq(fastboot_binary() or "termux-fastboot")
+    return adb + ' version 2>&1 | head -n 3; echo @@; ' + fb + ' --version 2>&1 | head -n 3' 
 
 
-def tool_health(root=True):
-    """Can adb and fastboot start? -> {'adb': error line or '', 'fastboot': ..., 'raw': text}."""
-    rc, out = su_run(TOOLS_CHECK, 25) if root else run_user(TOOLS_CHECK)
+def tool_health(root=None):
+    """Can the selected adb and fastboot backend start? Return errors and raw output."""
+    script = tools_check_script()
+    selected_root = have_root() if root is None else bool(root)
+    if selected_root == have_root():
+        rc, out = device_run(script, 25)
+    elif selected_root:
+        rc, out = su_run(script, 25)
+    else:
+        rc, out = run_user(script, 25)
     a, _, f = out.partition("@@")
-    return {"adb": tool_error(a), "fastboot": tool_error(f), "raw": out}
+    result = {"adb": tool_error(a), "fastboot": tool_error(f), "raw": out}
+    if not adb_binary(): result["adb"] = result["adb"] or "adb/termux-adb executable is missing"
+    if not fastboot_binary(): result["fastboot"] = result["fastboot"] or "fastboot/termux-fastboot executable is missing"
+    return result
 
 
 def tools_verdict():
-    """After the repair: test as normal user AND as root, and explain what it means."""
+    """Report health of the one backend FlashKit selected for this phone."""
     out = ["-------- result --------"]
-    u, r = tool_health(root=False), tool_health(root=True)
-    ubad, rbad = u["adb"] or u["fastboot"], r["adb"] or r["fastboot"]
-    if not ubad and not rbad:
-        out.append("OK adb and fastboot start fine now (normal user and root).")
-        out.append("Close FlashKit and open it again so it picks up the repaired files.")
+    th = tool_health(root=have_root())
+    bad = th["adb"] or th["fastboot"]
+    if not bad:
+        out.append("OK adb and fastboot start with the %s backend." % backend_name())
+        out.append("Close FlashKit and open it again so it picks up the repaired tools.")
         return "\n".join(out)
-    err = ubad or rbad
-    out.append("X still can't start: " + err)
-    if ubad and not rbad:
-        out.append("  It fails as the normal Termux user but works as root - an odd mix. "
-                   "Send me this screen.")
-        return "\n".join(out)
-    if rbad and not ubad:
-        out.append("  It works as the normal Termux user but fails when run as root, so the problem is "
-                   "the root environment, not the packages. Send me this screen.")
-        return "\n".join(out)
-    m = re.search(r'cannot locate symbol "([^"]+)"', err)
-    if m:
-        rc, found = run_user("grep -l -a -F -- %s %s/usr/lib/*.so* 2>/dev/null" % (shq(m.group(1)), BASE))
-        libs = [os.path.basename(x) for x in found.splitlines() if x.strip()]
-        out.append("  Missing symbol: " + m.group(1))
-        out.append("  Libraries on this phone that contain it: " + (", ".join(libs[:8]) or "none"))
-        if "libc++_shared.so" in libs:
-            out.append("  libc++_shared.so has it, so another copy is probably being loaded instead. "
-                       "Send me this screen.")
-        else:
-            out.append("  libc++_shared.so does NOT have it: Termux's C++ library and its adb/fastboot "
-                       "build don't match.")
-    rc, pol = run_user('apt-cache policy libc++ android-tools 2>/dev/null | grep -E "^[a-z]|Installed|Candidate"')
-    if pol:
-        out.append("  Package versions:")
-        out.extend("    " + x for x in pol.splitlines())
-    rc, arch = run_user("uname -m")
-    out.append("  CPU: " + (arch or "?"))
-    out.append("")
-    out.append("This looks like a packaging mismatch inside Termux, not your cable, adapter or the target "
-               "(another Termux user reported the same error on a different program on 30 Sep 2026). "
-               "What you can do: try again later, or run termux-change-repo in Termux to pick a different "
-               "mirror and then Repair again, or use a device where adb/fastboot already works as the host.")
+    out.append("X device tools still cannot start: " + bad)
+    if not have_root():
+        out.append("  Rootless mode requires termux-adb, termux-fastboot, the termux-api package, "
+                   "and the matching Termux:API Android app.")
+        out.append("  -> run: flashkit setup")
+    else:
+        out.append("  -> run termux-change-repo, then flashkit setup to refresh android-tools.")
     return "\n".join(out)
 
 
@@ -917,6 +975,8 @@ def local_list(path):
         pass  # Android hides some folders from apps - root can still read them
     except OSError as e:
         return [], str(e)
+    if not have_root():
+        return [], "This folder is not readable by Termux without root permission."
     rc, out = su_run(dir_script(path), timeout=15)
     return parse_dir(out)
 
@@ -2970,11 +3030,13 @@ class App:
 
     def adb(self):
         a = self.status.get("adb", [])
-        return "adb -s %s" % shq(a[0][0]) if len(a) > 1 else "adb"
+        binary = adb_binary() or "termux-adb"
+        return "%s -s %s" % (shq(binary), shq(a[0][0])) if len(a) > 1 else shq(binary)
 
     def fbt(self):
         f = self.status.get("fb", [])
-        return "fastboot -s %s" % shq(f[0]) if len(f) > 1 else "fastboot"
+        binary = fastboot_binary() or "termux-fastboot"
+        return "%s -s %s" % (shq(binary), shq(f[0])) if len(f) > 1 else shq(binary)
 
     def adb_mode(self):
         a = self.status.get("adb", [])
@@ -3031,8 +3093,8 @@ class App:
         if st["adb"] and st["adb"][0][1] == "device":
             ser = st["adb"][0][0]
             if ser not in self.models:
-                rc, out = su_run("adb -s %s shell 'getprop ro.product.model; getprop ro.build.version.release'"
-                                 % shq(ser), timeout=10)
+                rc, out = device_run("%s -s %s shell 'getprop ro.product.model; getprop ro.build.version.release'"
+                                     % (shq(adb_binary() or "termux-adb"), shq(ser)), timeout=10)
                 lines = [l.strip() for l in out.splitlines() if l.strip()]
                 self.models[ser] = (lines[0] + "  \u00b7  Android " + lines[1]) if len(lines) >= 2 else ""
             st["model"] = self.models.get(ser, "")
@@ -3058,8 +3120,7 @@ class App:
             return st
         self.last_fix, self.fix_tries, self.bad_streak = now, self.fix_tries + 1, 0
         log("autofix: " + problem)
-        su_run("adb kill-server; sleep 1; chmod -R 666 /dev/bus/usb/*/* 2>/dev/null; adb start-server",
-               timeout=25)
+        device_run(fix_connection_script(), timeout=25)
         time.sleep(1.0)
         st2 = probe()
         st2["fixed"] = "Auto-fix: restarted the adb server (%s)" % problem
@@ -3101,8 +3162,9 @@ class App:
     def refresh_home(self):
         st = self.status
         lines = []
-        if not st.get("root", True):
-            lines.append("Root: NOT granted")
+        lines.append("Access: %s" % ("root" if st.get("root") else "rootless Termux USB"))
+        if not st.get("backend_ok", False):
+            lines.append("USB tools: missing (run flashkit setup)")
         else:
             adb, fb = st["adb"], st["fb"]
             if fb:
@@ -3136,8 +3198,7 @@ class App:
 
     def fix_now(self):
         self.toast("Restarting adb server...")
-        su_run("adb kill-server; sleep 1; chmod -R 666 /dev/bus/usb/*/* 2>/dev/null; adb start-server",
-               timeout=25)
+        device_run(fix_connection_script(), timeout=25)
         self.fresh()
         self.toast("Done")
 
@@ -3160,8 +3221,15 @@ class App:
 
     @router
     def flow_repair(self):
-        self.go(self.sc_confirm, "Repair adb/fastboot", REPAIR_INFO,
-                lambda: self.go(self.sc_job, "Repairing adb/fastboot", REPAIR_SCRIPT, 1800, None,
+        if have_root():
+            info, script = REPAIR_INFO, REPAIR_SCRIPT
+        else:
+            info = ("Repair the non-root USB tools. This refreshes Termux packages, reinstalls the "
+                    "termux-adb / termux-fastboot pair, and verifies termux-usb. Android may show a USB "
+                    "permission prompt when a target is connected.")
+            script = "bash %s" % shq(os.path.join(os.path.dirname(__file__), "tools", "install_rootless.sh"))
+        self.go(self.sc_confirm, "Repair adb/fastboot", info,
+                lambda: self.go(self.sc_job, "Repairing adb/fastboot", script, 1800, None,
                                 tools_verdict, False), "Repair now", False)
 
     def sc_pick_file(self, title, exts, on_pick, mode="file"):
@@ -3206,14 +3274,14 @@ class App:
         self.btn(f, "Cancel", self.back, "flow", kind="tonal", h=60)
         self.btn(f, ok_text, check, "flow", kind="danger", h=60)
 
-    def sc_job(self, title, script, timeout=600, then=None, post=None, root=True, on_ok=None, extras=None):
+    def sc_job(self, title, script, timeout=600, then=None, post=None, root=None, on_ok=None, extras=None):
         self.stack = []  # a job is the end of the road: Back must not re-show the confirm screen
         box = self.begin_job(title)
         job = Job(title, script, timeout, post, root)
         JobView(self, box, job, "flow", then=then, on_ok=on_ok, extras=extras)
         self.start_job(job)
 
-    def go_job(self, title, script, timeout=600, then=None, post=None, root=True, on_ok=None, extras=None):
+    def go_job(self, title, script, timeout=600, then=None, post=None, root=None, on_ok=None, extras=None):
         self.go(self.sc_job, title, script, timeout, then, post, root, on_ok, extras)
 
     # ---- flows ---------------------------------------------------------------
@@ -3551,7 +3619,7 @@ class App:
 
     # ---- Files (device storage) ---------------------------------------------
     def remote_list(self, path):
-        rc, out = su_run("%s shell %s" % (self.adb(), shq(dir_script(path))), timeout=20)
+        rc, out = device_run("%s shell %s" % (self.adb(), shq(dir_script(path))), timeout=20)
         return parse_dir(out)
 
     def build_files(self):
@@ -4467,9 +4535,20 @@ class App:
                 pass
             if isinstance(getattr(j, "token", None), str) and not j.token.startswith("task"):
                 (root_lines if j.root else user_lines).append(kill_script(j.token))
-        root_lines += ["adb kill-server", "pkill -9 -x adb", "pkill -9 -x fastboot", "sleep 0.4", "am force-stop com.termux.gui"]
-        user_lines.append("adb kill-server")
-        for cmd in (["su", "-c", ENV + "\n".join(root_lines)], ["sh", "-c", "\n".join(user_lines)]):
+        adb = shq(adb_binary() or ("adb" if have_root() else "termux-adb"))
+        fb = shq(fastboot_binary() or ("fastboot" if have_root() else "termux-fastboot"))
+        cleanup = [adb + " kill-server", "pkill -9 -x adb", "pkill -9 -x fastboot",
+                   "pkill -9 -x termux-adb", "pkill -9 -x termux-fastboot", "sleep 0.4"]
+        if have_root():
+            root_lines += cleanup + ["am force-stop com.termux.gui"]
+        else:
+            user_lines += cleanup
+        commands = []
+        if root_lines and have_root():
+            commands.append(["su", "-c", ENV + "\n".join(root_lines)])
+        if user_lines:
+            commands.append(["sh", "-c", "\n".join(user_lines)])
+        for cmd in commands:
             try:
                 subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
@@ -4490,18 +4569,18 @@ class App:
         for label, key in (("Auto-fix connection problems", "autofix"),
                            ("Keep the screen on while a job runs", "keepon"),
                            ("Show the recovery's install log while sideloading", "sideload_log"),
-                           ("Check the device automatically (uses root every few seconds)", "autodetect")):
+                           ("Check the device automatically every few seconds", "autodetect")):
             self.cfg_toggle(ll, label, key)
         self.label(ll, "Diagnostics", size=13, color=MUTED, margin=8)
         self.btn(ll, "Run full diagnostics + auto-fix", self.run_diag, "settings", kind="primary", h=60)
-        self.btn(ll, "Repair adb/fastboot (updates Termux packages)", lambda: self.start_flow(self.flow_repair),
+        self.btn(ll, "Repair adb/fastboot / USB backend", lambda: self.start_flow(self.flow_repair),
                  "settings", kind="tonal", h=60)
         self.label(ll, "About", size=13, color=MUTED, margin=8)
         self.label(ll, "FlashKit GUI %s\nMade by Chakradhar Tode" % VERSION, size=16,
                    color=ACCENT, margin=8, selectable=True)
         self.btn(ll, "Quit completely (force stop)", self.sc_quit, "settings", kind="danger", h=56)
-        self.label(ll, "Log file: %s\nadb + fastboot run through su; this app itself runs as "
-                   "your normal Termux user." % LOGFILE, size=14, color=MUTED, margin=8, selectable=True)
+        self.label(ll, "Log file: %s\nBackend: %s." % (LOGFILE, backend_name()), size=14,
+                   color=MUTED, margin=8, selectable=True)
 
     def cfg_toggle(self, parent, label, key):
         def fmt():
@@ -4519,31 +4598,33 @@ class App:
         if self.busy:
             self.toast("A job is still running")
             return
-        script = ('echo "== root =="; id; '
-                  'echo "== tools =="; command -v adb; adb version 2>&1 | head -n 1; command -v fastboot; '
-                  'fastboot --version 2>&1 | head -n 1; '
+        adb = shq(adb_binary() or "termux-adb")
+        fb = shq(fastboot_binary() or "termux-fastboot")
+        script = ('echo "== backend =="; id; echo "' + backend_name() + '"; '
+                  'echo "== tools =="; command -v ' + adb + '; ' + adb + ' version 2>&1 | head -n 1; '
+                  'command -v ' + fb + '; ' + fb + ' --version 2>&1 | head -n 1; '
                   'echo "== usb nodes =="; ls -l /dev/bus/usb/*/* 2>&1 | head -n 12; '
                   'echo "== usb devices (id | maker | name / interfaces) =="; ' + uinfo_script() + '; '
-                  'echo "== adb =="; adb devices -l 2>&1; '
-                  'echo "== fastboot =="; fastboot devices -l 2>&1; '
+                  'echo "== adb =="; ' + adb + ' devices -l 2>&1; '
+                  'echo "== fastboot =="; ' + fb + ' devices -l 2>&1; '
                   'echo "== storage =="; df -h %s 2>&1 | tail -n 1' % shq(STORAGE_ROOT))
         self.start_flow(self.sc_job, "Diagnostics", script, 90, None, self.analyze)
 
     def analyze(self):
         """Runs after the raw checks: explains what it found and repairs what it can."""
         out = ["-------- findings --------"]
-        if not shutil.which("adb") or not shutil.which("fastboot"):
-            out.append("! adb/fastboot missing - installing android-tools...")
-            rc = subprocess.call(["pkg", "install", "-y", "android-tools"], stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-            out.append("  install %s" % ("ok" if rc == 0 else "FAILED - check internet"))
         st = probe()
-        if not st["root"]:
-            out.append("X Root not granted to Termux: %s" % st["err"])
-            out.append("  -> allow superuser for Termux in Magisk/KernelSU")
+        if not st.get("backend_ok"):
+            out.append("X Required USB tools are missing.")
+            if not st.get("root"):
+                out.append("  -> run flashkit setup to install termux-adb + termux-fastboot")
+            else:
+                out.append("  -> run flashkit setup to install android-tools")
             return "\n".join(out)
-        out.append("OK root works")
-        th = tool_health(root=True)
+        out.append("OK %s backend is available" % st.get("backend", "USB"))
+        adb = shq(adb_binary() or "termux-adb")
+        fb = shq(fastboot_binary() or "termux-fastboot")
+        th = tool_health(root=have_root())
         if th["adb"] or th["fastboot"]:
             out.append("X adb/fastboot can't start: " + (th["adb"] or th["fastboot"]))
             out.append("  Not your cable or the target - the programs themselves crash when launched.")
@@ -4555,8 +4636,7 @@ class App:
                 out.append("  -> try another OTG adapter/cable (many are charge-only) and re-plug")
             else:
                 out.append("! Target visible on USB but not answering; restarting the adb server...")
-                su_run("adb kill-server; sleep 1; chmod -R 666 /dev/bus/usb/*/* 2>/dev/null; adb start-server",
-                       timeout=25)
+                device_run(fix_connection_script(), timeout=25)
                 time.sleep(1.5)
                 st = probe()
         for ser, s in st["adb"]:
@@ -5413,10 +5493,18 @@ def bootstrap():
         import termuxgui  # noqa: F401
     except ImportError:
         print("Installing the termuxgui Python package...")
-        subprocess.call([sys.executable, "-m", "pip", "install", "termuxgui"])
-    if not (shutil.which("adb") and shutil.which("fastboot")):
-        print("Installing android-tools (adb + fastboot)...")
-        subprocess.call(["pkg", "install", "-y", "android-tools"])
+        rc = subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", "termuxgui"])
+        if rc == 0:
+            try:
+                import termuxgui  # noqa: F401
+            except ImportError:
+                pass
+    if have_root():
+        if not (shutil.which("adb") and shutil.which("fastboot")):
+            print("Installing android-tools (adb + fastboot)...")
+            subprocess.call(["pkg", "install", "-y", "android-tools"])
+    elif not (shutil.which("termux-adb") and shutil.which("termux-fastboot")):
+        print("Rootless USB tools are missing. Run: flashkit setup")
 
 
 def main():
@@ -5425,7 +5513,7 @@ def main():
     try:
         import termuxgui as _tg
     except ImportError:
-        print("Could not import termuxgui - run: pip install termuxgui")
+        print("Could not import the Termux:GUI Python bindings - run: python -m pip install --upgrade termuxgui")
         return 1
     tg = _tg
     try:

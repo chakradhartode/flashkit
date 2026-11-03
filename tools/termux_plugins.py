@@ -28,10 +28,12 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import xml.etree.ElementTree as ET
 
 TERMUX = "com.termux"
-PLUGINS = [("com.termux.gui", "Termux:GUI", "termux/termux-gui"),
-           ("com.termux.api", "Termux:API", "termux/termux-api")]
+# Install API first: the rootless adb/fastboot backend relies on termux-usb from Termux:API.
+PLUGINS = [("com.termux.api", "Termux:API", "termux/termux-api"),
+           ("com.termux.gui", "Termux:GUI", "termux/termux-gui")]
 GITHUB_API = os.environ.get("FK_GITHUB_API", "https://api.github.com").rstrip("/")
 FDROID_API = os.environ.get("FK_FDROID_API", "https://f-droid.org/api/v1/packages").rstrip("/")
 FDROID_REPO = os.environ.get("FK_FDROID_REPO", "https://f-droid.org/repo").rstrip("/")
@@ -155,8 +157,162 @@ def apk_certs(path):
     return [hashlib.sha256(c).hexdigest() for c in certs]
 
 
+def _axml_len8(data, pos):
+    if pos >= len(data):
+        raise ValueError("truncated Android string")
+    first = data[pos]
+    if first & 0x80:
+        if pos + 1 >= len(data):
+            raise ValueError("truncated Android string length")
+        return ((first & 0x7f) << 8) | data[pos + 1], pos + 2
+    return first, pos + 1
+
+
+def _axml_len16(data, pos):
+    if pos + 2 > len(data):
+        raise ValueError("truncated Android UTF-16 string")
+    first = struct.unpack_from("<H", data, pos)[0]
+    if first & 0x8000:
+        if pos + 4 > len(data):
+            raise ValueError("truncated Android UTF-16 length")
+        second = struct.unpack_from("<H", data, pos + 2)[0]
+        return ((first & 0x7fff) << 16) | second, pos + 4
+    return first, pos + 2
+
+
+def _axml_strings(data, chunk_start, chunk_size):
+    string_count, style_count, flags, strings_start = struct.unpack_from("<IIII", data, chunk_start + 8)
+    offsets_start = chunk_start + 28
+    utf8 = bool(flags & 0x100)
+    strings = []
+    for i in range(string_count):
+        off = struct.unpack_from("<I", data, offsets_start + i * 4)[0]
+        pos = chunk_start + strings_start + off
+        if utf8:
+            _, pos = _axml_len8(data, pos)  # UTF-16 code-unit length
+            byte_len, pos = _axml_len8(data, pos)
+            raw = data[pos:pos + byte_len]
+            if len(raw) != byte_len:
+                raise ValueError("truncated UTF-8 string pool")
+            strings.append(raw.decode("utf-8", "strict"))
+        else:
+            char_len, pos = _axml_len16(data, pos)
+            byte_len = char_len * 2
+            raw = data[pos:pos + byte_len]
+            if len(raw) != byte_len:
+                raise ValueError("truncated UTF-16 string pool")
+            strings.append(raw.decode("utf-16le", "strict"))
+    return strings
+
+
+def apk_manifest_info(path):
+    """Read package, split name and minSdkVersion from text or Android binary XML manifest."""
+    with zipfile.ZipFile(path) as z:
+        try:
+            data = z.read("AndroidManifest.xml")
+        except KeyError:
+            raise ValueError("APK has no AndroidManifest.xml")
+    if data.lstrip().startswith(b"<"):
+        root = ET.fromstring(data)
+        if root.tag != "manifest":
+            raise ValueError("manifest root element is invalid")
+        pkg = root.attrib.get("package", "")
+        split = root.attrib.get("split", "")
+        uses = root.find("uses-sdk")
+        min_sdk = None
+        if uses is not None:
+            value = uses.attrib.get("{http://schemas.android.com/apk/res/android}minSdkVersion")
+            if value is not None and value.isdigit():
+                min_sdk = int(value)
+        return {"package": pkg, "split": split, "min_sdk": min_sdk}
+
+    # Android compiled XML (RES_XML_TYPE). Only a handful of chunks/attributes are needed.
+    if len(data) < 8:
+        raise ValueError("manifest is too short")
+    typ, header_size, total_size = struct.unpack_from("<HHI", data, 0)
+    if typ != 0x0003 or header_size < 8 or total_size > len(data):
+        raise ValueError("AndroidManifest.xml is not valid Android binary XML")
+    strings = []
+    pkg, split, min_sdk = "", "", None
+    pos = header_size
+    while pos + 8 <= total_size:
+        ctype, chead, csize = struct.unpack_from("<HHI", data, pos)
+        if csize < 8 or pos + csize > total_size:
+            raise ValueError("invalid Android XML chunk size")
+        if ctype == 0x0001:  # RES_STRING_POOL_TYPE
+            strings = _axml_strings(data, pos, csize)
+        elif ctype == 0x0102 and strings:  # RES_XML_START_ELEMENT_TYPE
+            if chead < 16 or csize < 36:
+                raise ValueError("invalid Android XML start-tag chunk")
+            name_idx = struct.unpack_from("<I", data, pos + 20)[0]
+            tag = strings[name_idx] if name_idx < len(strings) else ""
+            attr_start, attr_size, attr_count = struct.unpack_from("<HHH", data, pos + 24)
+            attr_base = pos + 16 + attr_start
+            for i in range(attr_count):
+                a = attr_base + i * attr_size
+                if a + 20 > pos + csize or attr_size < 20:
+                    raise ValueError("invalid Android XML attribute")
+                aname = struct.unpack_from("<I", data, a + 4)[0]
+                raw_idx = struct.unpack_from("<I", data, a + 8)[0]
+                value_type = data[a + 15]
+                value_data = struct.unpack_from("<I", data, a + 16)[0]
+                attr = strings[aname] if aname < len(strings) else ""
+                raw_value = strings[raw_idx] if raw_idx != 0xffffffff and raw_idx < len(strings) else None
+                if raw_value is None and value_type == 0x03 and value_data < len(strings):
+                    raw_value = strings[value_data]
+                if tag == "manifest" and attr == "package":
+                    pkg = raw_value or ""
+                elif tag == "manifest" and attr == "split":
+                    split = raw_value or ""
+                elif tag == "uses-sdk" and attr == "minSdkVersion":
+                    if value_type in (0x10, 0x11):
+                        min_sdk = int(value_data)
+                    elif raw_value and raw_value.isdigit():
+                        min_sdk = int(raw_value)
+        pos += csize
+    if not pkg:
+        raise ValueError("could not read package name from AndroidManifest.xml")
+    return {"package": pkg, "split": split, "min_sdk": min_sdk}
+
+
+def validate_apk(path, expected_pkg):
+    """Reject corrupt, split-only, wrong-package, or too-new APKs before Android parses them."""
+    info = apk_manifest_info(path)
+    if info["package"] != expected_pkg:
+        raise ValueError("wrong package ID: expected %s, found %s" % (expected_pkg, info["package"] or "unknown"))
+    if info["split"]:
+        raise ValueError("split APK (%s) cannot be installed by itself" % info["split"])
+    sdk = None
+    try:
+        rc, out = run(["getprop", "ro.build.version.sdk"], 8, sysenv=True)
+        if rc == 0 and out.strip().isdigit():
+            sdk = int(out.strip())
+    except Exception:
+        pass
+    if sdk is not None and info["min_sdk"] is not None and info["min_sdk"] > sdk:
+        raise ValueError("requires Android API %d; this device provides API %d" % (info["min_sdk"], sdk))
+    return info
+
+
 def same_signer(a, b):
     return bool(a) and bool(b) and a[0] in b
+
+
+def preferred_sources(installer="", release=None):
+    """Prefer the same distribution that signed Termux, including modern Termux builds
+    that expose TERMUX_APK_RELEASE even when Android hides installer metadata.
+    Signature verification remains the final authority whenever it is readable.
+    """
+    release = os.environ.get("TERMUX_APK_RELEASE", "") if release is None else release
+    source_hint = re.sub(r"[^a-z]", "", (release or "").lower())
+    installer_hint = (installer or "").lower()
+    if "fdroid" in source_hint or "fdroid" in installer_hint:
+        return ["fdroid", "github"]
+    if "github" in source_hint:
+        return ["github", "fdroid"]
+    # Google Play does not publish matching official Termux plugin APKs.
+    # Keep fallback order for diagnostics; signature checks/Android will refuse incompatible builds.
+    return ["github", "fdroid"]
 
 
 # ---------------------------------------------------------------- talking to Android
@@ -196,8 +352,11 @@ def have_root():
         if os.environ.get("FK_NO_ROOT"):
             _ROOT = False
         else:
-            rc, out = run("id -u", timeout=60, root=True)
-            _ROOT = rc == 0 and out.strip().splitlines()[-1:] == ["0"]
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                _ROOT = True
+            else:
+                rc, out = run("id -u", timeout=10, root=True)
+                _ROOT = rc == 0 and out.strip().splitlines()[-1:] == ["0"]
     return _ROOT
 
 
@@ -371,6 +530,17 @@ def iter_matching(pkg, label, termux_certs, order, workdir, abi, tried):
                 say("    not a valid APK - skipped")
                 os.remove(dest)
                 continue
+            try:
+                info = validate_apk(dest, pkg)
+                say("    APK manifest OK (%s%s)" % (info["package"],
+                    ", min Android API %s" % info["min_sdk"] if info.get("min_sdk") else ""))
+            except Exception as e:
+                say("    APK rejected before installation: %s" % e)
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+                continue
             certs = apk_certs(dest)
             tried.append((src, c["name"], certs[:1]))
             if not termux_certs:
@@ -444,13 +614,26 @@ def install_root_one(apk, pkg, uninstall_first):
 
 
 def install_manual_one(apk, pkg):
-    """No root: open Android's own installer and wait until the plugin shows up."""
+    """No root: open Android's installer and wait until the plugin shows up.
+
+    Leave a one-shot startup marker in case Android force-stops Termux during plugin installation.
+    """
+    os.makedirs(FKDIR, exist_ok=True)
+    marker = os.path.join(FKDIR, "open-next")
+    open(marker, "w").close()
     say("  Opening Android's installer for %s - tap Install." % pkg)
     say("  If it says installing from Termux isn't allowed: tap Settings, turn on 'Allow from this source', press Back, tap Install.")
-    run(["termux-open", apk], 20)
+    os.chmod(apk, 0o644)
+    opened = run(["termux-open", "--view", "--content-type", "application/vnd.android.package-archive", apk], 20)
+    if opened[0] != 0:
+        run(["termux-open", apk], 20)
     start, settings, again = time.time(), False, False
     while time.time() - start < 300:
         if present(pkg):
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
             return True, ""
         t = time.time() - start
         if t > 30 and not settings:
@@ -459,8 +642,12 @@ def install_manual_one(apk, pkg):
             run(["am", "start", "-a", "android.settings.MANAGE_UNKNOWN_APP_SOURCES", "-d", "package:com.termux"], 15)
         if t > 120 and not again:
             again = True
-            run(["termux-open", apk], 20)
+            run(["termux-open", "--view", "--content-type", "application/vnd.android.package-archive", apk], 20)
         time.sleep(3)
+    try:
+        os.remove(marker)  # still running, so Android did not restart Termux
+    except OSError:
+        pass
     return False, "timed out waiting for the installation"
 
 
@@ -495,7 +682,8 @@ def main(argv=None):
     if not todo:
         say("Nothing to do.")
         return 0
-    order = [args.source] if args.source else (["fdroid", "github"] if "fdroid" in installer else ["github", "fdroid"])
+    order = [args.source] if args.source else preferred_sources(installer)
+    say("Plugin source preference: %s (the APK signing key is still checked when readable)." % " then ".join(order))
     if "vending" in installer:
         say("Note: your Termux comes from Google Play; its plugins must come from Play too, so this usually can't work.")
     if not have_root():

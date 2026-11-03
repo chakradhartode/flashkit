@@ -16,7 +16,15 @@ VERSION="$(cat "$DIR/VERSION" 2>/dev/null || echo '?')"
 printf '\033[1mFlashKit %s\033[0m\n' "$VERSION"
 
 step "Packages"
-need=(python android-tools git curl termux-api dialog)
+# Stock android-tools need root for OTG USB enumeration. Non-root phones use the
+# termux-adb/termux-fastboot pair, which requests USB access through Termux:API.
+ROOT_OK=0
+if command -v su >/dev/null 2>&1 && timeout 10 su -c 'id -u' 2>/dev/null | grep -qx '0'; then ROOT_OK=1; fi
+if [ "$ROOT_OK" = 1 ]; then
+  need=(python android-tools git curl termux-api dialog)
+else
+  need=(python git curl termux-api dialog)
+fi
 missing=()
 for p in "${need[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
 if [ "$MODE" = full ] || [ ${#missing[@]} -gt 0 ]; then
@@ -25,16 +33,18 @@ if [ "$MODE" = full ] || [ ${#missing[@]} -gt 0 ]; then
     pkg install -y "${missing[@]}" || die "Could not install: ${missing[*]}"
   fi
 fi
-ok "python, adb/fastboot, git, curl, termux-api, dialog"
-dpkg -s termux-gui-package >/dev/null 2>&1 || pkg install -y termux-gui-package >/dev/null 2>&1 || true
-
+if [ "$ROOT_OK" = 1 ]; then ok "python, android-tools, git, curl, termux-api, dialog"
+else ok "python, git, curl, termux-api, dialog (rootless USB tools are installed in the next step)"; fi
 step "Python library (termuxgui)"
 if python -c "import termuxgui" 2>/dev/null; then
-  [ "$MODE" = full ] && pip install --upgrade termuxgui >/dev/null 2>&1
-  ok "termuxgui"
+  if [ "$MODE" = full ]; then
+    python -m pip install --upgrade termuxgui || warn "Could not refresh termuxgui; keeping the installed version"
+  fi
+  ok "termuxgui Python bindings"
 else
-  pip install --upgrade termuxgui || die "pip could not install termuxgui"
-  ok "termuxgui installed"
+  python -m pip install --upgrade termuxgui || die "Could not install the termuxgui Python bindings. Check the connection, then run: python -m pip install termuxgui"
+  python -c "import termuxgui" 2>/dev/null || die "termuxgui did not import after installation"
+  ok "termuxgui Python bindings installed"
 fi
 
 if [ "$MODE" != deps ]; then
@@ -67,10 +77,15 @@ START
 fi
 
 if [ "$PLUGINS" = 1 ]; then
-  step "Termux:GUI and Termux:API (matched to your Termux's signature)"
+  step "Termux:API and Termux:GUI (matched to your Termux's signature)"
   mkdir -p "$HOME/.flashkit"; touch "$HOME/.flashkit/open-next"   # if Android restarts Termux while installing, the next session opens FlashKit
   python "$DIR/tools/termux_plugins.py" || warn "Plugins are not all set up - see the messages above, then run: flashkit plugins"
   rm -f "$HOME/.flashkit/open-next"
+fi
+
+if [ "$ROOT_OK" = 0 ] && [ "$MODE" != deps ]; then
+  step "Rootless USB backend"
+  bash "$DIR/tools/install_rootless.sh" || warn "Rootless USB tools could not be installed. Re-run: flashkit setup"
 fi
 
 printf '\n\033[1;32mDone.\033[0m  Open FlashKit with:  \033[1mflashkit\033[0m  (or  start flashkit)     Update later with:  \033[1mflashkit update\033[0m\n'

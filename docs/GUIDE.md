@@ -20,7 +20,7 @@ Plug the second device into your phone with the OTG cable. The card at the top t
 
 Tap **Refresh status** to re-check. If adb/fastboot themselves are crashing, a **Fix connection now** button appears.
 
-> **Tip:** FlashKit checks the device every few seconds using root. You can switch that off in **Settings → Check the device automatically**.
+> **Tip:** FlashKit checks the device every few seconds using the selected backend. Rooted phones use `adb` / `fastboot`; non-root phones use `termux-adb` / `termux-fastboot` and request USB access through Termux:API. You can switch automatic checks off in **Settings → Check the device automatically**.
 
 ## 2. Sideload a ROM zip
 

@@ -91,9 +91,12 @@ do_doctor() {
   case "${PREFIX:-}" in *com.termux*) say "  ok   running in Termux" ;; *) say "  FAIL not running in Termux" ;; esac
   command -v python >/dev/null && say "  ok   $(python --version 2>&1)" || say "  FAIL python missing"
   python -c "import termuxgui" 2>/dev/null && say "  ok   termuxgui" || say "  FAIL termuxgui (run: flashkit setup)"
-  for t in adb fastboot git curl dialog termux-clipboard-set; do command -v $t >/dev/null && say "  ok   $t" || say "  FAIL $t missing (run: flashkit setup)"; done
+  ROOT_OK=0
+  if command -v su >/dev/null 2>&1 && timeout 10 su -c 'id -u' 2>/dev/null | grep -qx 0; then ROOT_OK=1; fi
+  if [ "$ROOT_OK" = 1 ]; then ADB=adb; FB=fastboot; say "  ok   root available"; else ADB=termux-adb; FB=termux-fastboot; say "  ok   rootless mode (root is optional)"; fi
+  for t in "$ADB" "$FB" git curl dialog termux-clipboard-set; do command -v "$t" >/dev/null && say "  ok   $t" || say "  FAIL $t missing (run: flashkit setup)"; done
+  if [ "$ROOT_OK" = 0 ]; then command -v termux-usb >/dev/null && say "  ok   termux-usb" || say "  FAIL termux-api package missing (run: flashkit setup)"; fi
   [ -d "$HOME/storage/shared" ] && say "  ok   storage allowed" || say "  FAIL storage not allowed (run: flashkit setup)"
-  if command -v su >/dev/null; then timeout 30 su -c id 2>/dev/null | grep -q 'uid=0' && say "  ok   root works" || say "  FAIL root denied/timed out (allow Termux in your root manager)"; else say "  FAIL no su - this phone isn't rooted (needed to flash)"; fi
   python "$DIR/tools/termux_plugins.py" --check
 }
 

@@ -1,20 +1,30 @@
-#!/system/bin/sh
-# FlashKit - root adb/fastboot toolkit for Termux, dialog UI
-# Run as: su -c sh /path/to/flashkit.sh
+#!/data/data/com.termux/files/usr/bin/bash
+# FlashKit text menu. Root is optional; non-root uses Termux's USB-permission backend.
 
-PREFIX=/data/data/com.termux/files/usr
-HOME=/data/data/com.termux/files/home
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+HOME="${HOME:-/data/data/com.termux/files/home}"
 TMPDIR="$PREFIX/tmp"
 PATH="$PREFIX/bin:$PATH:/system/bin:/system/xbin:/sbin"
 export PREFIX HOME TMPDIR PATH
 mkdir -p "$TMPDIR" 2>/dev/null
+FLASHKIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if [ "$(id -u)" != "0" ]; then
-  echo "Not root. Run it as: su -c sh $0"
-  exit 1
+ROOT_OK=0
+if command -v su >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 && timeout 10 su -c 'id -u' 2>/dev/null | grep -qx '0'; then ROOT_OK=1; fi
+if [ "$ROOT_OK" = 1 ]; then
+  DEVICE_ADB=adb; DEVICE_FASTBOOT=fastboot
+else
+  DEVICE_ADB=termux-adb; DEVICE_FASTBOOT=termux-fastboot
 fi
+# Put executable aliases first in PATH so commands also work when run via `timeout`.
+FK_BIN="$TMPDIR/flashkit-bin"
+mkdir -p "$FK_BIN"
+if command -v "$DEVICE_ADB" >/dev/null 2>&1; then ln -sf "$(command -v "$DEVICE_ADB")" "$FK_BIN/adb"; fi
+if command -v "$DEVICE_FASTBOOT" >/dev/null 2>&1; then ln -sf "$(command -v "$DEVICE_FASTBOOT")" "$FK_BIN/fastboot"; fi
+PATH="$FK_BIN:$PATH"
+export PATH
 
-VERSION="v11"
+VERSION="g11"
 STORAGE_ROOT="/storage/emulated/0"
 [ -d "$STORAGE_ROOT" ] || STORAGE_ROOT="/sdcard"
 
@@ -99,13 +109,18 @@ run_boxed() {
 
 install_deps() {
   clear
-  echo "FlashKit $VERSION - checking packages (adb, fastboot, dialog)..."
+  echo "FlashKit $VERSION - checking packages ($DEVICE_ADB, $DEVICE_FASTBOOT, dialog)..."
   pkg update -y >/dev/null 2>&1
-  pkg install -y android-tools dialog >/dev/null 2>&1
-  if command -v adb >/dev/null 2>&1 && command -v fastboot >/dev/null 2>&1 && command -v dialog >/dev/null 2>&1; then
-    echo "OK - adb, fastboot and dialog are all present."
+  if [ "$ROOT_OK" = 1 ]; then
+    pkg install -y android-tools dialog >/dev/null 2>&1
   else
-    echo "WARNING: something is still missing after install (check your internet), continuing anyway..."
+    pkg install -y termux-api dialog >/dev/null 2>&1
+    bash "$FLASHKIT_DIR/tools/install_rootless.sh" || true
+  fi
+  if command -v "$DEVICE_ADB" >/dev/null 2>&1 && command -v "$DEVICE_FASTBOOT" >/dev/null 2>&1 && command -v dialog >/dev/null 2>&1; then
+    echo "OK - $DEVICE_ADB, $DEVICE_FASTBOOT and dialog are present."
+  else
+    echo "WARNING: USB tools are still missing (check the install output / internet), continuing anyway..."
     sleep 2
   fi
 }
@@ -113,12 +128,13 @@ install_deps() {
 # Lightweight auto-fix: reinstalls adb/fastboot if missing, clears a
 # stuck server, and re-opens USB node permissions.
 fix_adb() {
-  if ! command -v adb >/dev/null 2>&1 || ! command -v fastboot >/dev/null 2>&1; then
-    pkg install -y android-tools >/dev/null 2>&1
+  if ! command -v "$DEVICE_ADB" >/dev/null 2>&1 || ! command -v "$DEVICE_FASTBOOT" >/dev/null 2>&1; then
+    if [ "$ROOT_OK" = 1 ]; then pkg install -y android-tools >/dev/null 2>&1
+    else bash "$FLASHKIT_DIR/tools/install_rootless.sh" || true; fi
   fi
   adb kill-server >/dev/null 2>&1
   rm -f "$HOME"/.android/adb*.lock 2>/dev/null
-  chmod -R 666 /dev/bus/usb/*/* 2>/dev/null
+  [ "$ROOT_OK" = 1 ] && chmod -R 666 /dev/bus/usb/*/* 2>/dev/null
   adb start-server >/dev/null 2>&1
   sleep 1
 }
@@ -580,13 +596,14 @@ $(fastboot devices 2>/dev/null)"
 # state, all in one report.
 act_fix() {
   msg=""
-  if command -v adb >/dev/null 2>&1 && command -v fastboot >/dev/null 2>&1; then
-    msg="adb/fastboot: installed"
+  if command -v "$DEVICE_ADB" >/dev/null 2>&1 && command -v "$DEVICE_FASTBOOT" >/dev/null 2>&1; then
+    msg="$DEVICE_ADB / $DEVICE_FASTBOOT: installed"
   else
-    msg="adb/fastboot: was missing, reinstalling now"
+    msg="$DEVICE_ADB / $DEVICE_FASTBOOT: missing, trying repair"
   fi
   fix_adb
-  usb="$(ls /dev/bus/usb/*/* 2>/dev/null)"
+  if [ "$ROOT_OK" = 1 ]; then usb="$(ls /dev/bus/usb/*/* 2>/dev/null)"
+  else usb="$(ls -1 /sys/bus/usb/devices 2>/dev/null | head -n 12)"; fi
   if [ -z "$usb" ]; then
     msg="$msg
 USB: nothing on the OTG port at all - try a different cable/adapter"

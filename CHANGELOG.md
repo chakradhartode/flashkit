@@ -1,4 +1,20 @@
-# 📝 Changelog
+## g11 - rootless reliability and plugin installer hardening
+
+- Extend the rootless `termux-adb` / `termux-fastboot` backend to the optional text menu as well as the GUI.
+- Fix fastbootd detection and improve rootless diagnostics; document that polling uses the selected backend.
+- Scope the rootless USB repository signing key to its own APT source and correctly normalize armored key files.
+- Reject invalid, wrong-package, split-only, corrupt, or Android-incompatible Termux plugin APKs before opening Android's package installer.
+
+# FlashKit changelog
+
+## g10 - rootless Termux USB support and safer plugin installs
+- Root is now optional. Rooted devices keep the stock `adb` / `fastboot` path; non-rooted devices use `termux-adb` / `termux-fastboot` through Termux:API USB permissions.
+- Installer configures the rootless USB repository with `curl` and validates its OpenPGP key before adding it.
+- Termux:API is installed before Termux:GUI so the rootless USB path is available as early as possible.
+- Removed the unnecessary `termux-gui-package` apt install; FlashKit needs the Android Termux:GUI app and its Python binding, not that optional demo bundle.
+- Plugin downloads are checked for APK archive integrity, package ID, split-package status, and minimum Android version before the Android installer is opened.
+- Doctor, connection repair, device detection, file browsing, console and job execution now follow the selected root/rootless backend.
+
 
 The app is at **g9**. Work on the repo, the installer and the `flashkit` command since then did not change the app's version, so it is listed together here.
 
